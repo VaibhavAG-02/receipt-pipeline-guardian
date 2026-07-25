@@ -258,6 +258,45 @@ def _money(s: str) -> float:
     return float(s.replace(",", "."))
 
 
+# RapidOCR (and heavy OCR compression) often strips the spaces between tokens,
+# yielding "BREAD007225003712F2.88N". This recovers name + price from that:
+# the price is the last money token that is NOT immediately preceded by 3+ more
+# digits (which would make it part of a SKU/UPC), and the name is the leading
+# alphabetic run.
+_MONEY = re.compile(r"(?<!\d)(\d{1,4}[.,]\d{2})(?!\d)")
+
+
+def _clean_name(name: str) -> str:
+    """Trim SKU/UPC digits and tax flags that bleed into an OCR'd product name,
+    e.g. "GV PARM 16OZ 007874201510 F" -> "GV PARM 16OZ"."""
+    # cut at the first long digit run (a product code, not a pack size)
+    name = re.split(r"\s+\d{4,}", name)[0]
+    # drop a trailing lone tax flag letter
+    name = re.sub(r"\s+[A-Z]$", "", name.strip())
+    return name.strip()
+
+
+def _parse_spaceless(line: str) -> dict | None:
+    prices = list(_MONEY.finditer(line))
+    if not prices:
+        return None
+    price = float(prices[-1].group(1).replace(",", "."))
+    if price <= 0 or price > 9999:
+        return None
+    m = re.match(r"^(\d{0,3}\s?[A-Za-z][A-Za-z .&/\-]*[A-Za-z0-9])", line)
+    if not m:
+        return None
+    name = _clean_name(m.group(1).strip())
+    if len(name) < 2:
+        return None
+    return {
+        "sku": "OCR-" + re.sub(r"[^A-Z0-9]", "", name.upper())[:8],
+        "name": name,
+        "qty": 1,
+        "unit_price": price,
+    }
+
+
 def _parse_item_line(line: str) -> dict | None:
     """Return an item dict for a receipt line, or None if it is not an item.
 
@@ -272,8 +311,8 @@ def _parse_item_line(line: str) -> dict | None:
     elif m := LINE_NAMED_RE.match(line):
         name, qty, price = m.group("name"), 1, m.group("price")
     else:
-        return None
-    name = name.strip()
+        return _parse_spaceless(line)
+    name = _clean_name(name)
     if len(name) < 2:  # reject noise like a lone letter
         return None
     return {
@@ -327,34 +366,104 @@ def parse_receipt_text(text: str) -> dict[str, Any]:
     }
 
 
-def ocr_text(image_bytes: bytes) -> str:
-    """Run Tesseract. Raises IngestError with a usable message if unavailable."""
+def _score_text(text: str) -> int:
+    """How many parseable item lines a raw OCR string yields. Used to pick the
+    best engine/preprocessing for a given image rather than betting on one."""
+    return sum(1 for ln in text.splitlines() if _parse_item_line(ln.strip()))
+
+
+def _ocr_tesseract(image_bytes: bytes) -> str:
+    import pytesseract
+    from PIL import Image, ImageFilter, ImageOps
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    if img.width < 1000:
+        scale = 1000 / img.width
+        img = img.resize((int(img.width * scale), int(img.height * scale)))
+    img = ImageOps.autocontrast(img, cutoff=2)
+
+    def _binary(im, cut):
+        return im.point(lambda px: 255 if px > cut else 0)
+
+    candidates = [
+        img,
+        _binary(img, 140),
+        _binary(img, 170),
+        _binary(img.filter(ImageFilter.MedianFilter(3)), 155),
+    ]
+    best, best_n = "", -1
+    for cand in candidates:
+        txt = pytesseract.image_to_string(cand, config="--psm 6")
+        n = _score_text(txt)
+        if n > best_n:
+            best, best_n = txt, n
+    return best
+
+
+def _ocr_rapid(image_bytes: bytes) -> str:
+    """RapidOCR: PaddleOCR models on ONNX. A learned text detector, so it copes
+    with rotation, curl and uneven light far better than a fixed threshold. Free,
+    offline, no API. Returns "" if the package is not installed so the caller
+    falls back to Tesseract."""
     try:
-        import pytesseract
+        import numpy as np
         from PIL import Image
+    except ImportError:
+        return ""
+    engine = _rapid_engine()
+    if engine is None:
+        return ""
+    arr = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    result, _ = engine(arr)
+    if not result:
+        return ""
+    # RapidOCR returns detected boxes; join their text top-to-bottom into lines.
+    return "\n".join(line[1] for line in result)
+
+
+_RAPID_SINGLETON = []
+
+
+def _rapid_engine():
+    """Instantiate RapidOCR once. Model load is slow; cache it across calls."""
+    if _RAPID_SINGLETON:
+        return _RAPID_SINGLETON[0]
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+        _RAPID_SINGLETON.append(RapidOCR())
+    except Exception:
+        _RAPID_SINGLETON.append(None)
+    return _RAPID_SINGLETON[0]
+
+
+def ocr_text(image_bytes: bytes) -> str:
+    """Read a receipt image to text, choosing the best available engine.
+
+    Tries RapidOCR and Tesseract and keeps whichever yields more parseable item
+    lines. Neither is reliable on a badly skewed or glare-blown photo -- OCR of
+    thermal receipts is genuinely hard -- but between them the common cases work.
+    """
+    try:
+        from PIL import Image  # noqa: F401
     except ImportError as exc:
-        raise IngestError(
-            "OCR needs pytesseract and Pillow: pip install -r requirements-ocr.txt"
-        ) from exc
+        raise IngestError("OCR needs Pillow: pip install -r requirements.txt") from exc
 
+    reads: list[str] = []
+    rapid = _ocr_rapid(image_bytes)
+    if rapid:
+        reads.append(rapid)
     try:
-        img = Image.open(io.BytesIO(image_bytes))
-    except Exception as exc:
-        raise IngestError("That file could not be opened as an image.") from exc
+        reads.append(_ocr_tesseract(image_bytes))
+    except Exception:
+        pass  # tesseract binary may be absent; RapidOCR alone is fine
 
-    # Grayscale plus a hard threshold: thermal receipts are high-contrast text
-    # on light stock, and Tesseract does markedly better on a clean binary image
-    # than on a photo with shadows across it.
-    img = img.convert("L")
-    img = img.point(lambda p: 255 if p > 160 else 0)
-    try:
-        # psm 6: assume a single uniform block of text, which is what a receipt is.
-        return pytesseract.image_to_string(img, config="--psm 6")
-    except Exception as exc:
+    if not reads:
         raise IngestError(
-            "Tesseract is not installed on this machine. On Streamlit Cloud add a "
-            "packages.txt containing `tesseract-ocr`."
-        ) from exc
+            "No OCR engine is available. Install rapidocr-onnxruntime (pure pip) "
+            "or the tesseract-ocr system binary."
+        )
+    # Keep the read that parses into the most line items.
+    return max(reads, key=_score_text)
 
 
 def ocr_receipt(image_bytes: bytes, **meta) -> tuple[pd.DataFrame, dict[str, Any]]:
