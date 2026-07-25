@@ -215,17 +215,73 @@ def build_receipt(
 
 
 # ------------------------------------------------------------------ OCR ---
-LINE_RE = re.compile(
+# Two shapes of receipt line, tried in order:
+#   1. "2  Milk           4.29"   -> leading quantity (my renderer, many stores)
+#   2. "BREAD 007225003712 F 2.88 N" -> Walmart-style: name, product code,
+#      optional tax flag, price, optional trailing tax letter. No leading qty.
+# The price is always the last money-looking token on the line; everything
+# before the first long digit run or the price is the name.
+LINE_QTY_RE = re.compile(
     r"^(?P<qty>\d{1,3})\s*[xX@]?\s+(?P<name>[A-Za-z][A-Za-z0-9 .'\-/]{2,30}?)\s+"
     r"\$?(?P<price>\d{1,5}[.,]\d{2})\s*$"
 )
+LINE_NAMED_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9 .'&\-/]{1,28}?[A-Za-z])\s+"  # product name
+    r"(?:\d{6,}\s+)?"                                        # optional SKU/UPC
+    r"(?:[A-Z]\s+)?"                                          # optional tax flag (F/T/N)
+    r"\$?(?P<price>\d{1,5}[.,]\d{2})"                        # price
+    r"(?:\s+[A-Z0-9])?\s*$"                                  # optional trailing code
+)
+# Lines that are clearly not items, even if they match the shape loosely.
+NOT_ITEM_RE = re.compile(
+    r"\b(total|subtotal|tax|change|tend|debit|credit|balance|account|ref|"
+    r"network|approv|purchase|items sold|store|manager|phone|savings|"
+    r"cash|visa|master|payment|declin)\b",
+    re.I,
+)
+# Summary lines lead with a keyword that Tesseract mangles on thermal print:
+# TAX -> TAK / 1AX / TAK, TOTAL -> T0TAL / TDTAL, SUBTOTAL -> SUBT0TAL. A line
+# STARTING with one of these near-spellings is a summary line, not a product,
+# even when the exact word did not survive OCR.
+SUMMARY_MISREAD_RE = re.compile(
+    r"^(t[a0o][xk]|[t1][o0]tal|subt[o0]tal|[a-z]?tax|chan[gq]e|tend)\b",
+    re.I,
+)
 TOTAL_RE = re.compile(r"\b(total|amount due|balance)\b.*?\$?(\d{1,6}[.,]\d{2})", re.I)
 SUBTOTAL_RE = re.compile(r"\bsub\s*total\b.*?\$?(\d{1,6}[.,]\d{2})", re.I)
-TAX_RE = re.compile(r"\btax\b.*?\$?(\d{1,6}[.,]\d{2})", re.I)
+# Match the tax *amount*, not a rate: ignore any number trailed by % (e.g.
+# "TAX 1 7.000 %  3.26" -> 3.26, not 7.000).
+TAX_RE = re.compile(r"\btax\b\s*\d*\s*(?:[\d.]+\s*%\s*)?\$?(\d{1,6}[.,]\d{2})(?!\s*%)", re.I)
 
 
 def _money(s: str) -> float:
     return float(s.replace(",", "."))
+
+
+def _parse_item_line(line: str) -> dict | None:
+    """Return an item dict for a receipt line, or None if it is not an item.
+
+    Handles both the leading-quantity layout and the Walmart-style
+    name/SKU/price layout. Excludes summary lines (total, tax, tender, etc.)
+    up front so a stray "TOTAL 46.30" is never mistaken for a product.
+    """
+    if NOT_ITEM_RE.search(line) or SUMMARY_MISREAD_RE.match(line):
+        return None
+    if m := LINE_QTY_RE.match(line):
+        name, qty, price = m.group("name"), int(m.group("qty")), m.group("price")
+    elif m := LINE_NAMED_RE.match(line):
+        name, qty, price = m.group("name"), 1, m.group("price")
+    else:
+        return None
+    name = name.strip()
+    if len(name) < 2:  # reject noise like a lone letter
+        return None
+    return {
+        "sku": "OCR-" + re.sub(r"[^A-Z0-9]", "", name.upper())[:8],
+        "name": name,
+        "qty": qty,
+        "unit_price": _money(price),
+    }
 
 
 def parse_receipt_text(text: str) -> dict[str, Any]:
@@ -253,15 +309,9 @@ def parse_receipt_text(text: str) -> dict[str, Any]:
         if (m := TAX_RE.search(line)) and tax is None:
             tax = _money(m.group(1))
             continue
-        if m := LINE_RE.match(line):
-            items.append(
-                {
-                    "sku": "OCR-" + re.sub(r"[^A-Z0-9]", "", m.group("name").upper())[:8],
-                    "name": m.group("name").strip(),
-                    "qty": int(m.group("qty")),
-                    "unit_price": _money(m.group("price")),
-                }
-            )
+        item = _parse_item_line(line)
+        if item is not None:
+            items.append(item)
         else:
             unparsed.append(line)
 
