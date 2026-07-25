@@ -41,7 +41,14 @@ H = lambda s: st.markdown(s, unsafe_allow_html=True)  # noqa: E731
 
 def _run(cmd: list[str], cwd: Path, env_extra: dict[str, str] | None = None) -> None:
     env = {**os.environ, "PYTHONPATH": str(ROOT / "src"), **(env_extra or {})}
-    subprocess.run(cmd, cwd=cwd, env=env, check=True, capture_output=True)
+    proc = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        # Show the real cause in the UI. capture_output otherwise hides it and
+        # the user sees only an opaque CalledProcessError.
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-25:]
+        st.error(f"`{' '.join(cmd)}` failed (exit {proc.returncode})")
+        st.code("\n".join(tail) or "no output captured")
+        raise RuntimeError(f"step failed: {' '.join(cmd)}")
 
 
 def build_warehouse(n_receipts: int, seed: int) -> None:
@@ -50,8 +57,11 @@ def build_warehouse(n_receipts: int, seed: int) -> None:
         _run([sys.executable, "-m", "rpg.pipeline", "--receipts", str(n_receipts),
               "--seed", str(seed)], cwd=ROOT)
         st.write("Building bronze, silver and gold, then running data checks")
-        _run(["dbt", "build", "--profiles-dir", "."], cwd=ROOT / "dbt",
-             env_extra={"RPG_WAREHOUSE": str(WAREHOUSE)})
+        # `python -m dbt.cli.main` rather than a bare `dbt`: the console script
+        # may not be on PATH in a hosted environment, but the module always is
+        # if dbt installed at all. Same interpreter, no PATH assumption.
+        _run([sys.executable, "-m", "dbt.cli.main", "build", "--profiles-dir", "."],
+             cwd=ROOT / "dbt", env_extra={"RPG_WAREHOUSE": str(WAREHOUSE)})
         status.update(label="Pipeline built", state="complete", expanded=False)
 
 
