@@ -1,0 +1,3 @@
+# Optional: only needed for the PySpark scale-out job. Requires a JDK (17 or 21).
+-r requirements.txt
+pyspark>=3.5

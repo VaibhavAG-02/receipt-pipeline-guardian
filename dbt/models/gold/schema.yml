@@ -1,0 +1,103 @@
+version: 2
+
+models:
+  - name: dim_store
+    description: >
+      Type 2 store dimension. One row per store version, with a half-open
+      [valid_from, valid_to) interval so facts pin to the store as it was.
+    columns:
+      - name: store_key
+        tests: [not_null, unique]
+      - name: store_natural_key
+        tests: [not_null]
+      - name: valid_from
+        tests: [not_null]
+      - name: valid_to
+        tests: [not_null]
+      - name: region
+        tests:
+          - accepted_values:
+              values: [northeast, midatlantic, southeast, midwest, west]
+      - name: store_format
+        tests:
+          - accepted_values:
+              values: [express, standard, supercenter]
+
+  - name: dim_date
+    columns:
+      - name: date_key
+        tests: [not_null, unique]
+      - name: calendar_date
+        tests: [not_null, unique]
+
+  - name: dim_sku
+    columns:
+      - name: sku_key
+        tests: [not_null, unique]
+      - name: sku_natural_key
+        tests: [not_null, unique]
+
+  - name: fct_receipt
+    description: Receipt-grain fact with surrogate FKs and model output.
+    columns:
+      - name: receipt_id
+        tests: [not_null, unique]
+      - name: store_key
+        description: Resolved by point-in-time join; must never be orphaned.
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_store')
+              field: store_key
+      - name: date_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_date')
+              field: date_key
+      - name: anomaly_score
+        tests: [not_null]
+      - name: computed_total
+        tests: [not_null]
+
+  - name: fct_receipt_line
+    columns:
+      - name: sku_key
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_sku')
+              field: sku_key
+      - name: store_key
+        tests:
+          - relationships:
+              to: ref('dim_store')
+              field: store_key
+
+  - name: mart_review_queue
+    columns:
+      - name: receipt_id
+        tests: [not_null, unique]
+      - name: model_reasoning
+        description: Top signed SHAP contributions for this specific receipt.
+        tests: [not_null]
+      - name: rule_based_hint
+        tests:
+          - accepted_values:
+              values: [poor_image, implausible_quantity, does_not_reconcile,
+                       price_outlier, behavioural]
+
+  - name: mart_quality_metrics
+    columns:
+      - name: submitted_date
+        tests: [not_null, unique]
+
+  - name: mart_store_health
+    columns:
+      - name: n_receipts
+        tests: [not_null]
+
+  - name: mart_model_slices
+    columns:
+      - name: slice
+        tests: [not_null]

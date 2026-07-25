@@ -1,0 +1,9 @@
+# Local, file-based DuckDB. No warehouse account, no credentials, no cost.
+receipt_guardian:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('RPG_WAREHOUSE', '../data/warehouse.duckdb') }}"
+      threads: 4
+      extensions: []

@@ -1,0 +1,122 @@
+name: ci
+
+# Free on GitHub Actions for public repos. The whole pipeline runs on the
+# hosted runner -- no external service, no secrets, nothing to pay for.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # The photo-upload path needs the Tesseract binary. Installing it here
+      # keeps those tests running in CI instead of silently skipping.
+      - name: Install Tesseract
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tesseract-ocr
+
+      # PySpark needs a JVM. Pinning Temurin 17 keeps the Spark stage and its
+      # tests running in CI instead of silently skipping.
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check src tests app scripts
+
+      - name: Unit tests
+        run: PYTHONPATH=src python -m pytest tests -q
+
+      # The pipeline runs for real in CI. If the contract gate fails its own
+      # thresholds, the build fails -- data quality is a build gate, not a
+      # dashboard someone checks later.
+      - name: Run pipeline
+        run: PYTHONPATH=src python -m rpg.pipeline --receipts 20000
+
+      - name: Assert quality gate passed
+        run: |
+          python - <<'PY'
+          import json, sys, pathlib
+          s = json.loads(pathlib.Path("data/artifacts/run_summary.json").read_text())
+          gate = s["gate"]
+          print(json.dumps(gate, indent=2))
+          if not gate["passed"]:
+              sys.exit("contract gate failed: " + "; ".join(gate["failures"]))
+          PY
+
+      # A model that silently degrades is worse than one that fails loudly, so
+      # CI enforces a floor on the metric that actually matters operationally.
+      - name: Assert model still meets its floor
+        run: |
+          python - <<'PY'
+          import json, sys, pathlib
+          m = json.loads(pathlib.Path("data/artifacts/metrics.json").read_text())
+          print(json.dumps({k: v for k, v in m.items() if not isinstance(v, dict)}, indent=2))
+          floors = {"pr_auc": 0.75, "precision_at_5pct": 0.80}
+          bad = [f"{k}={m[k]} < {v}" for k, v in floors.items() if m[k] < v]
+          if bad:
+              sys.exit("model regression: " + "; ".join(bad))
+          PY
+
+      # The PySpark stage: aggregate the landing zone and hand a bronze parquet
+      # to dbt. Real work on every push, not a script left in the repo.
+      - name: Run PySpark stage
+        run: PYTHONPATH=src python -m rpg.spark_job --input data/raw --emit-bronze
+
+      # Fairness is a release gate, not a report. A candidate that improves on
+      # average while a slice collapses does not ship.
+      - name: Assert drift + fairness gates
+        run: |
+          python - <<'PY'
+          import json, sys, pathlib
+          s = json.loads(pathlib.Path("data/artifacts/run_summary.json").read_text())
+          d = s["drift"]
+          print("prediction PSI:", d["prediction_psi"], "| status:", d["prediction_status"])
+          print("drifted features:", d["drifted_features"])
+          print("fairness passed:", s["fairness_passed"])
+          for v in s["fairness_violations"]:
+              print("  violation:", v)
+          if not s["fairness_passed"]:
+              sys.exit("fairness gate blocked promotion")
+          PY
+
+      # spark_bronze:true turns on br_spark_store_health and the cross-engine
+      # test that asserts Spark and dbt compute the same reconciliation counts.
+      - name: dbt build (bronze -> silver -> gold, + data tests)
+        working-directory: dbt
+        env:
+          RPG_WAREHOUSE: ../data/warehouse.duckdb
+        run: >
+          dbt build --profiles-dir .
+          --vars '{spark_bronze: true, spark_bronze_path: ../data/raw/spark_store_health.parquet}'
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-artifacts
+          path: |
+            data/artifacts/
+            dbt/target/
+          retention-days: 7

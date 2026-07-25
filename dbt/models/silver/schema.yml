@@ -1,0 +1,35 @@
+version: 2
+
+models:
+  - name: sl_receipts
+    columns:
+      - name: receipt_id
+        tests: [not_null, unique]
+      - name: reported_total
+        tests: [not_null]
+      - name: currency
+        tests:
+          - accepted_values:
+              values: ["USD"]
+      - name: payment_method
+        tests:
+          - accepted_values:
+              values: [card, cash, wallet, ebt]
+
+  - name: sl_receipt_items
+    columns:
+      - name: receipt_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('sl_receipts')
+              field: receipt_id
+      - name: qty
+        tests: [not_null]
+
+  - name: sl_store_versions
+    columns:
+      - name: store_id
+        tests: [not_null]
+      - name: valid_from
+        tests: [not_null]

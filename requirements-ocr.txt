@@ -1,0 +1,6 @@
+# Optional: photo upload path. Needs the Tesseract binary too --
+# macOS: brew install tesseract | Debian/Ubuntu: apt install tesseract-ocr
+# Streamlit Cloud: add a packages.txt containing `tesseract-ocr`
+-r requirements.txt
+pytesseract>=0.3.10
+Pillow>=10

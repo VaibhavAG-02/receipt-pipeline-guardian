@@ -1,0 +1,21 @@
+name: "receipt_guardian"
+version: "2.0.0"
+config-version: 2
+profile: "receipt_guardian"
+
+model-paths: ["models"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  receipt_guardian:
+    bronze:
+      +materialized: view      # thin typed layer over the landing zone
+      +schema: bronze
+    silver:
+      +materialized: table     # conformed, deduplicated, business rules applied
+      +schema: silver
+    gold:
+      +materialized: table     # star schema + consumption marts
+      +schema: gold

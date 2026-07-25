@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: br_quarantine
+    description: Contract-gate rejects. Retained and queryable, never dropped.
+    columns:
+      - name: quarantine_reason
+        tests:
+          - not_null
+          - accepted_values:
+              values: [missing_required_field, non_positive_total, unknown_store,
+                       empty_items, future_timestamp, bad_currency]
+  - name: br_store_master
+    columns:
+      - name: store_id
+        tests: [not_null]
+      - name: change_reason
+        tests:
+          - accepted_values:
+              values: [initial_load, remodel, district_realignment, manager_change]
